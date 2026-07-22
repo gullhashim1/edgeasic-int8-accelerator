@@ -2,9 +2,13 @@
 *.vvp
 *.vcd
 a.out
-tb/sim/
 sim/
+tb/sim/
+build/
 
-# Python cache
+# Windows Zone.Identifier metadata streams
+*:Zone.Identifier
+
+# Python cache & pyc bytecode
 __pycache__/
 *.pyc
