@@ -1,6 +1,7 @@
 `timescale 1ns/1ps
 
-import edgeasic_config_pkg::*;
+import config_pkg::*;
+import types_pkg::*;
 
 module tb_systolic_array_8x8;
 

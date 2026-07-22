@@ -1,7 +1,8 @@
 //Metadata follows lane 0 / maximum-delay timing and is valid only when out_valid is high.
 `timescale 1ns/1ps
 
-import edgeasic_config_pkg::*;
+import config_pkg::*;
+import types_pkg::*;
 
 module sddu (
 

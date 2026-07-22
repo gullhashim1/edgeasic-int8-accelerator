@@ -4,7 +4,8 @@
 
 module tb_pe_mac;
 
-    import edgeasic_config_pkg::*;
+    import config_pkg::*;
+import types_pkg::*;
     
     logic clk;
     logic rst_n;

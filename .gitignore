@@ -1,0 +1,10 @@
+# Simulation build artifacts & waveform dumps
+*.vvp
+*.vcd
+a.out
+tb/sim/
+sim/
+
+# Python cache
+__pycache__/
+*.pyc

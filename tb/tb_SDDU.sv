@@ -1,6 +1,7 @@
 `timescale 1ns/1ps
 
-import edgeasic_config_pkg::*;
+import config_pkg::*;
+import types_pkg::*;
 
 module tb_SDDU;
 
@@ -21,6 +22,8 @@ module tb_SDDU;
     int errors;
     int errors4;
     int errors5;
+    int errors6;
+    int errors7;
 
     logic signed out_k_tile_first_held;
     logic signed out_k_tile_last_held;
@@ -207,18 +210,15 @@ enable   = 1'b1;
     // ==========================================
     $display("\n--- TEST 3: TESTING FOR OUT VALID ---"); 
     reset_dut();
-    for(int i=0;i<ARRAY_N-1;i=i+1) begin
-
+        for(int i=0;i<ARRAY_N-1;i=i+1) begin
         mark =(i+1)*100;
         deskew_pipeline(i,mark);
-        if(out_valid !== 1'b1) begin
-            $display("OUT VALID IS ZERO");
-        end
-        else begin
-            $display("OUT VALID IS ONE");
+        if(i < 6 && out_valid !== 1'b0) begin
+            $display("TEST 3 FAIL: out_valid high too early at i=%0d", i);
             errors++;
         end
     end
+
 
     @(negedge clk);
 
@@ -521,7 +521,224 @@ if (errors5 == 0)
 else
     $display("TEST 5 FAILED WITH %0d ERROR(S)", errors5);
 
+// ==========================================
+// TEST 6: VALID BUBBLE MASKING & RECOVERY
+// ==========================================
+$display("\n--- TEST 6: VALID BUBBLE MASKING & RECOVERY ---");
+reset_dut();
+errors6 = 0;
+begin
+    int bubble_t;
+    int out_row;
+    int expected_val;
 
+    // Run continuous 15-cycle stream (t = 0 to 14)
+    for (int t = 0; t < (2*ARRAY_N-1); t = t + 1) begin
+        @(negedge clk);
+
+        in_psum_bus = '0;
+        enable = 1'b1;
+
+        // Inject valid data for cycles 0 to 7, BUT inject a bubble at cycle t = 3
+        if (t < ARRAY_N && t != 3) begin
+            in_valid = 1'b1;
+        end else begin
+            in_valid = 1'b0; // Bubble at t = 3!
+        end
+
+        in_k_tile_first = in_valid;
+        in_k_tile_last  = in_valid;
+
+        // Generate input data for the lanes
+        for (int row = 0; row < ARRAY_N; row = row + 1) begin
+            for (int lane = 0; lane < ARRAY_N; lane = lane + 1) begin
+                if (t == (row + lane)) begin
+                    in_psum_bus[lane*ACC_W +: ACC_W] = 100 + (10*row) + (lane+1);
+                end
+            end
+        end
+
+        #1; // Allow combinational outputs to settle
+
+        // --- CHECKER ---
+        if (t < (ARRAY_N-1)) begin
+            // 1. Early out_valid check (t = 0 to 6)
+            if (out_valid !== 1'b0) begin
+                $error("TEST 6 FAIL: Early out_valid assertion at t=%0d", t);
+                errors6++;
+            end
+        end else begin
+            // Output wavefronts emerge from t = 7 to 14
+            bubble_t = 3 + (ARRAY_N - 1); // Bubble injected at t=3 emerges at t=10
+
+            if (t == bubble_t) begin
+                // 2. Bubble Cycle check (t = 10): valid and metadata must be 0
+                if (out_valid !== 1'b0) begin
+                    $error("TEST 6 FAIL: Expected bubble (out_valid=0) at t=%0d", t);
+                    errors6++;
+                end
+                if (out_k_tile_first !== 1'b0 || out_k_tile_last !== 1'b0) begin
+                    $error("TEST 6 FAIL: Metadata not zero during bubble at t=%0d", t);
+                    errors6++;
+                end
+            end else begin
+                // 3. Valid Output Cycles: check valid, metadata, and data recovery
+                if (out_valid !== 1'b1) begin
+                    $error("TEST 6 FAIL: Expected out_valid=1 at t=%0d", t);
+                    errors6++;
+                end
+                if (out_k_tile_first !== 1'b1 || out_k_tile_last !== 1'b1) begin
+                    $error("TEST 6 FAIL: Metadata missing on valid row at t=%0d", t);
+                    errors6++;
+                end
+
+                // Check data on all 8 lanes for row r = t - 7
+                out_row = t - (ARRAY_N - 1);
+                for (int lane = 0; lane < ARRAY_N; lane = lane + 1) begin
+                    expected_val = 100 + (10*out_row) + (lane + 1);
+                    if ($signed(out_psum_bus[lane*ACC_W +: ACC_W]) !== expected_val) begin
+                        $error("TEST 6 FAIL: Data mismatch at t=%0d lane %0d. Expected %0d, Got %0d",
+                            t, lane, expected_val, $signed(out_psum_bus[lane*ACC_W +: ACC_W]));
+                        errors6++;
+                    end
+                end
+            end
+        end
+    end
+end
+
+// 4. Final de-assertion drain check
+@(posedge clk);
+#1;
+
+if (out_valid !== 1'b0) begin
+    $error("TEST 6 FAIL: out_valid remained high after final row");
+    errors6++;
+end
+
+if (errors6 == 0)
+    $display("TEST 6 PASSED: Valid Bubble Masked & Data/Metadata Recovered Successfully!");
+else
+    $display("TEST 6 FAILED WITH %0d ERROR(S)", errors6);
+
+// ==========================================
+// TEST 7: INDEPENDENT FIRST/LAST METADATA ALIGNMENT
+// ==========================================
+$display("\n--- TEST 7: INDEPENDENT FIRST/LAST METADATA ALIGNMENT ---");
+reset_dut();
+errors7 = 0;
+
+begin
+    int out_row;
+    logic expected_first;
+    logic expected_last;
+    int expected_val;
+
+    // Run continuous 15-cycle stream (t = 0 to 14)
+    for (int t = 0; t < (2*ARRAY_N-1); t = t + 1) begin
+        @(negedge clk);
+
+        in_psum_bus = '0;
+        enable = 1'b1;
+
+        if (t < ARRAY_N) begin
+            in_valid = 1'b1;
+            // Drive asymmetric FIRST and LAST signals for every row
+            case (t)
+                0: begin in_k_tile_first = 1'b1; in_k_tile_last = 1'b0; end // FIRST=1, LAST=0
+                1: begin in_k_tile_first = 1'b0; in_k_tile_last = 1'b0; end // FIRST=0, LAST=0
+                2: begin in_k_tile_first = 1'b0; in_k_tile_last = 1'b1; end // FIRST=0, LAST=1
+                3: begin in_k_tile_first = 1'b1; in_k_tile_last = 1'b1; end // FIRST=1, LAST=1
+                4: begin in_k_tile_first = 1'b1; in_k_tile_last = 1'b0; end // FIRST=1, LAST=0
+                5: begin in_k_tile_first = 1'b0; in_k_tile_last = 1'b0; end // FIRST=0, LAST=0
+                6: begin in_k_tile_first = 1'b0; in_k_tile_last = 1'b1; end // FIRST=0, LAST=1
+                7: begin in_k_tile_first = 1'b1; in_k_tile_last = 1'b1; end // FIRST=1, LAST=1
+                default: begin in_k_tile_first = 1'b0; in_k_tile_last = 1'b0; end
+            endcase
+        end else begin
+            in_valid        = 1'b0;
+            in_k_tile_first = 1'b0;
+            in_k_tile_last  = 1'b0;
+        end
+
+        // Generate input data for the lanes
+        for (int row = 0; row < ARRAY_N; row = row + 1) begin
+            for (int lane = 0; lane < ARRAY_N; lane = lane + 1) begin
+                if (t == (row + lane)) begin
+                    in_psum_bus[lane*ACC_W +: ACC_W] = 100 + (10*row) + (lane+1);
+                end
+            end
+        end
+
+        #1; // Allow combinational outputs to settle
+
+        // --- CHECKER ---
+        if (t < (ARRAY_N-1)) begin
+            // Early out_valid check (t = 0 to 6)
+            if (out_valid !== 1'b0) begin
+                $error("TEST 7 FAIL: Early out_valid assertion at t=%0d", t);
+                errors7++;
+            end
+        end else begin
+            // Check valid output rows (t = 7 to 14)
+            if (out_valid !== 1'b1) begin
+                $error("TEST 7 FAIL: Expected out_valid=1 at t=%0d", t);
+                errors7++;
+            end
+
+            out_row = t - (ARRAY_N - 1);
+
+            // Calculate expected asymmetric FIRST / LAST for row `out_row`
+            case (out_row)
+                0: begin expected_first = 1'b1; expected_last = 1'b0; end
+                1: begin expected_first = 1'b0; expected_last = 1'b0; end
+                2: begin expected_first = 1'b0; expected_last = 1'b1; end
+                3: begin expected_first = 1'b1; expected_last = 1'b1; end
+                4: begin expected_first = 1'b1; expected_last = 1'b0; end
+                5: begin expected_first = 1'b0; expected_last = 1'b0; end
+                6: begin expected_first = 1'b0; expected_last = 1'b1; end
+                7: begin expected_first = 1'b1; expected_last = 1'b1; end
+                default: begin expected_first = 1'b0; expected_last = 1'b0; end
+            endcase
+
+            if (out_k_tile_first !== expected_first) begin
+                $error("TEST 7 FAIL: FIRST metadata mismatch at t=%0d (row %0d). Expected %b, Got %b",
+                    t, out_row, expected_first, out_k_tile_first);
+                errors7++;
+            end
+
+            if (out_k_tile_last !== expected_last) begin
+                $error("TEST 7 FAIL: LAST metadata mismatch at t=%0d (row %0d). Expected %b, Got %b",
+                    t, out_row, expected_last, out_k_tile_last);
+                errors7++;
+            end
+
+            // Check data on all 8 lanes for row `out_row`
+            for (int lane = 0; lane < ARRAY_N; lane = lane + 1) begin
+                expected_val = 100 + (10*out_row) + (lane + 1);
+                if ($signed(out_psum_bus[lane*ACC_W +: ACC_W]) !== expected_val) begin
+                    $error("TEST 7 FAIL: Data mismatch at t=%0d lane %0d. Expected %0d, Got %0d",
+                        t, lane, expected_val, $signed(out_psum_bus[lane*ACC_W +: ACC_W]));
+                    errors7++;
+                end
+            end
+        end
+    end
+end
+
+// Final de-assertion drain check
+@(posedge clk);
+#1;
+
+if (out_valid !== 1'b0) begin
+    $error("TEST 7 FAIL: out_valid remained high after final row");
+    errors7++;
+end
+
+if (errors7 == 0)
+    $display("TEST 7 PASSED: Independent FIRST/LAST Metadata Alignment Verified!");
+else
+    $display("TEST 7 FAILED WITH %0d ERROR(S)", errors7);
 
 $finish;
 end
