@@ -19,6 +19,9 @@ module tb_SDDU;
     logic out_k_tile_first;
     logic out_k_tile_last;
 
+    logic [ACC_ADDR_W-1:0] in_acc_addr;
+    logic [ACC_ADDR_W-1:0] out_acc_addr;
+
     int errors;
     int errors4;
     int errors5;
@@ -38,10 +41,12 @@ module tb_SDDU;
         .in_psum_bus(in_psum_bus),
         .in_k_tile_first(in_k_tile_first),
         .in_k_tile_last(in_k_tile_last),
+        .in_acc_addr(in_acc_addr),
         .out_valid(out_valid),
         .out_psum_bus(out_psum_bus),
         .out_k_tile_first(out_k_tile_first),
-        .out_k_tile_last(out_k_tile_last)
+        .out_k_tile_last(out_k_tile_last),
+        .out_acc_addr(out_acc_addr)
     );
     
     always #5 clk = ~clk;
@@ -55,6 +60,7 @@ module tb_SDDU;
         in_psum_bus = '0;
         in_k_tile_first = 1'b0;
         in_k_tile_last = 1'b0;
+        in_acc_addr = '0;
 
 
         repeat(2) @(posedge clk);
