@@ -12,6 +12,7 @@ package config_pkg;
     localparam int WGT_W  = DATA_W;        // INT8 Weight precision alias
     localparam int OUT_W  = DATA_W;        // INT8 Output precision alias
     localparam int ACC_W = 32;             // INT32 Accumulator precision[cite: 1, 8]
+    localparam int ACC_BUFF = 33;          // INT33 Accumulation buffer precision
     localparam int BIAS_W = 32;            // INT32 Bias precision
     localparam int SCALE_W = 24;           // INT24 Quantization fixed-point scale precision[cite: 8]
     localparam int SHIFT_W = 8;            // Right-shift parameter precision
