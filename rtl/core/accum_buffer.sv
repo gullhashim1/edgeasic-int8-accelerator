@@ -19,21 +19,21 @@ module accum_buffer(
 
     logic signed [ACC_BUFF*ARRAY_N-1:0] mem [0:2**ACC_ADDR_W-1];
 
+    // 1. Instant Asynchronous Read (0-cycle delay)
     always_comb begin
-        if (write_enable) begin
-            mem[write_address] = write_data;
-        end
-        else begin
-            mem[write_address] = '0;
-        end
-
         if (read_enable) begin
             read_data = mem[read_address];
-        end
-        else begin
+        end else begin
             read_data = '0;
-
         end
     end
+
+    // 2. Permanent Synchronous Write (Saves on clock edge)
+    always_ff @(posedge clk) begin
+        if (write_enable) begin
+            mem[write_address] <= write_data;
+        end
+    end
+
 
 endmodule
