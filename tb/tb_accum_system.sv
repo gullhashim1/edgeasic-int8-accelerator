@@ -85,18 +85,19 @@ module tb_accum_system;
     end
     endtask
 
-    task drive_inputs(
+    // Driver task supporting packed vectors and clean combinational/sequential assertions
+    task drive_inputs_packed(
         input logic en,
-        input logic signed [ACC_W-1:0] psum_val,
+        input logic signed [ARRAY_N*ACC_W-1:0] psum_bus_in,
         input logic k_first,
         input logic k_last,
-        input logic signed [BIAS_W-1:0] bias_val,
+        input logic signed [ARRAY_N*BIAS_W-1:0] bias_bus_in,
         input logic valid,
         input logic [ACC_ADDR_W-1:0] acc_addr,
         input logic exp_out_valid,
         input logic exp_write_en,
         input logic exp_read_en,
-        input logic signed [ACC_BUFF-1:0] exp_sum
+        input logic signed [ARRAY_N*ACC_BUFF-1:0] exp_sum_bus_in
     );
     begin 
         @(negedge clk);
@@ -105,21 +106,15 @@ module tb_accum_system;
         in_k_tile_first = k_first;
         in_k_tile_last  = k_last;
         in_acc_addr     = acc_addr;
+        in_psum_bus     = psum_bus_in;
+        bias_in_bus     = bias_bus_in;
 
-        // Fill all 8 lanes in parallel
-        for (int lane = 0; lane < ARRAY_N; lane = lane + 1) begin
-            in_psum_bus[lane*ACC_W +: ACC_W]   = psum_val;
-            bias_in_bus[lane*BIAS_W +: BIAS_W] = bias_val;
-        end
+        #1; // Settle combinational logic on negedge clk BEFORE write clock edge!
 
-        // Wait for clock edge + 1 time-unit sampling delay
-        @(posedge clk);
-        #1;
+        $display("  -> Inputs: addr=%0d, FIRST=%b, LAST=%b, valid=%b, enable=%b",
+                 acc_addr, k_first, k_last, valid, en);
 
-        $display("  -> Inputs: psum_lane=%0d, bias_lane=%0d, addr=%0d, FIRST=%b, LAST=%b, valid=%b",
-                 $signed(psum_val), $signed(bias_val), acc_addr, k_first, k_last, valid);
-
-        // Self-checking assertions
+        // 1. Check control signals using !== (detects X and Z)
         if (out_valid !== exp_out_valid) begin
             $error("FAIL: out_valid mismatch! Expected %b, Got %b", exp_out_valid, out_valid);
             errors++;
@@ -135,17 +130,90 @@ module tb_accum_system;
             errors++;
         end
 
-        if (exp_out_valid) begin
+        // 2. Direct Buffer Address & Write Data Assertions (Sampled before write edge!)
+        if (exp_write_en) begin
+            if (buf_write_addr !== acc_addr) begin
+                $error("FAIL: buf_write_addr mismatch! Expected %0d, Got %0d", acc_addr, buf_write_addr);
+                errors++;
+            end
             for (int lane = 0; lane < ARRAY_N; lane = lane + 1) begin
-                logic signed [ACC_BUFF-1:0] act_sum;
-                act_sum = $signed(out_acc_bus[lane*ACC_BUFF +: ACC_BUFF]);
-                if (act_sum !== exp_sum) begin
-                    $error("FAIL: Lane %0d output mismatch! Expected %0d, Got %0d", lane, $signed(exp_sum), act_sum);
+                logic signed [ACC_BUFF-1:0] act_wdata, exp_wdata;
+                act_wdata = $signed(buf_write_data[lane*ACC_BUFF +: ACC_BUFF]);
+                exp_wdata = $signed(exp_sum_bus_in[lane*ACC_BUFF +: ACC_BUFF]);
+                if (act_wdata !== exp_wdata) begin
+                    $error("FAIL: Lane %0d write data expected %0d, got %0d", lane, exp_wdata, act_wdata);
                     errors++;
                 end
             end
-            $display("  -> VERIFIED 8-LANE ACCUMULATED OUTPUT VECTOR = %0d (out_valid=1)", $signed(exp_sum));
         end
+
+        if (exp_read_en) begin
+            if (buf_read_addr !== acc_addr) begin
+                $error("FAIL: buf_read_addr mismatch! Expected %0d, Got %0d", acc_addr, buf_read_addr);
+                errors++;
+            end
+        end
+
+        // 3. Advance to posedge clk and verify output metadata & vector when exp_out_valid=1
+        @(posedge clk);
+        #1;
+
+        if (exp_out_valid) begin
+            if (out_acc_addr !== acc_addr) begin
+                $error("FAIL: out_acc_addr expected %0d, got %0d", acc_addr, out_acc_addr);
+                errors++;
+            end
+            if (out_k_tile_first !== k_first) begin
+                $error("FAIL: out_k_tile_first mismatch! Expected %b, Got %b", k_first, out_k_tile_first);
+                errors++;
+            end
+            if (out_k_tile_last !== k_last) begin
+                $error("FAIL: out_k_tile_last mismatch! Expected %b, Got %b", k_last, out_k_tile_last);
+                errors++;
+            end
+
+            for (int lane = 0; lane < ARRAY_N; lane = lane + 1) begin
+                logic signed [ACC_BUFF-1:0] act_sum, exp_s;
+                act_sum = $signed(out_acc_bus[lane*ACC_BUFF +: ACC_BUFF]);
+                exp_s   = $signed(exp_sum_bus_in[lane*ACC_BUFF +: ACC_BUFF]);
+                if (act_sum !== exp_s) begin
+                    $error("FAIL: Lane %0d output sum expected %0d, got %0d", lane, exp_s, act_sum);
+                    errors++;
+                end
+                $display("     Lane %0d: psum=%0d | bias=%0d | out_acc_bus=%0d",
+                         lane, $signed(in_psum_bus[lane*ACC_W +: ACC_W]),
+                         $signed(bias_in_bus[lane*BIAS_W +: BIAS_W]), act_sum);
+            end
+            $display("  -> VERIFIED FULL 8-LANE ACCUMULATED OUTPUT VECTOR & METADATA!");
+        end
+    end
+    endtask
+
+    // Helper task for uniform scalar lane values
+    task drive_inputs(
+        input logic en,
+        input logic signed [ACC_W-1:0] psum_val,
+        input logic k_first,
+        input logic k_last,
+        input logic signed [BIAS_W-1:0] bias_val,
+        input logic valid,
+        input logic [ACC_ADDR_W-1:0] acc_addr,
+        input logic exp_out_valid,
+        input logic exp_write_en,
+        input logic exp_read_en,
+        input logic signed [ACC_BUFF-1:0] exp_sum
+    );
+        logic signed [ARRAY_N*ACC_W-1:0] psum_bus_tmp;
+        logic signed [ARRAY_N*BIAS_W-1:0] bias_bus_tmp;
+        logic signed [ARRAY_N*ACC_BUFF-1:0] exp_bus_tmp;
+    begin
+        for (int l = 0; l < ARRAY_N; l = l + 1) begin
+            psum_bus_tmp[l*ACC_W +: ACC_W]      = psum_val;
+            bias_bus_tmp[l*BIAS_W +: BIAS_W]    = bias_val;
+            exp_bus_tmp[l*ACC_BUFF +: ACC_BUFF] = exp_sum;
+        end
+        drive_inputs_packed(en, psum_bus_tmp, k_first, k_last, bias_bus_tmp, valid, acc_addr,
+                            exp_out_valid, exp_write_en, exp_read_en, exp_bus_tmp);
     end
     endtask
 
@@ -168,32 +236,67 @@ module tb_accum_system;
         // ==========================================
         $display("\n--- TEST 1: Single Sub-tile (K=1, FIRST=1, LAST=1) ---");
         drive_inputs(1'b1, 32'sd5, 1'b1, 1'b1, 32'sd10, 1'b1, 8'h01,
-                     1'b1, 1'b0, 1'b0, 33'sd15); // Exp: valid=1, write=0, read=0, sum=15
+                     1'b1, 1'b0, 1'b0, 33'sd15);
 
         // ==========================================
-        // TEST 2: Clock Gating Check (enable=0)
+        // TEST 2: Enable Stall & Resume Check
         // ==========================================
-        $display("\n--- TEST 2: Clock Gating Check (enable=0) ---");
-        drive_inputs(1'b0, 32'sd5, 1'b1, 1'b1, 32'sd10, 1'b1, 8'h01,
-                     1'b0, 1'b0, 1'b0, 33'sd0); // Exp: valid=0, write=0, read=0
-
-        // ==========================================
-        // TEST 3: Continuous Multi-K Transaction (K=3, Addr=0x05)
-        // ==========================================
-        $display("\n--- TEST 3: Continuous Multi-K Transaction (K=3, Addr=0x05) ---");
+        $display("\n--- TEST 2: Enable Stall & Resume Check ---");
         reset_dut();
 
-        $display(" Sub-tile 1 (k=0, FIRST=1, LAST=0): Seed Bias=100 + Psum=20");
+        $display(" Sub-tile 1 (k=0, FIRST=1, LAST=0): Seed Bias=100 + Psum=20 => RAM[0x05] = 120");
         drive_inputs(1'b1, 32'sd20, 1'b1, 1'b0, 32'sd100, 1'b1, 8'h05,
-                     1'b0, 1'b1, 1'b0, 33'sd120); // Exp: valid=0, write=1 (RAM=120), read=0
+                     1'b0, 1'b1, 1'b0, 33'sd120);
 
-        $display(" Sub-tile 2 (k=1, FIRST=0, LAST=0): Add Psum=30 to RAM[0x05]");
+        $display(" STALL FOR 2 CYCLES (enable=0)");
+        drive_inputs(1'b0, 32'sd99, 1'b0, 1'b0, 32'sd99, 1'b1, 8'h05,
+                     1'b0, 1'b0, 1'b0, 33'sd0);
+        drive_inputs(1'b0, 32'sd99, 1'b0, 1'b0, 32'sd99, 1'b1, 8'h05,
+                     1'b0, 1'b0, 1'b0, 33'sd0);
+
+        $display(" RESUME Sub-tile 2 (k=1, FIRST=0, LAST=0): Add Psum=30 => RAM[0x05] = 150");
         drive_inputs(1'b1, 32'sd30, 1'b0, 1'b0, 32'sd0, 1'b1, 8'h05,
-                     1'b0, 1'b1, 1'b1, 33'sd150); // Exp: valid=0, write=1 (RAM=150), read=1
+                     1'b0, 1'b1, 1'b1, 33'sd150);
 
-        $display(" Sub-tile 3 (k=2, FIRST=0, LAST=1): Final Psum=50 + RAM[0x05]");
+        $display(" RESUME Sub-tile 3 (k=2, FIRST=0, LAST=1): Final Psum=50 => Output = 200");
         drive_inputs(1'b1, 32'sd50, 1'b0, 1'b1, 32'sd0, 1'b1, 8'h05,
-                     1'b1, 1'b0, 1'b1, 33'sd200); // Exp: valid=1, write=0, read=1, sum=200!
+                     1'b1, 1'b0, 1'b1, 33'sd200);
+
+        // ==========================================
+        // TEST 3: Distinct Per-Lane Ordering Test
+        // ==========================================
+        $display("\n--- TEST 3: Distinct Per-Lane Ordering Test ---");
+        reset_dut();
+        begin
+            logic signed [ARRAY_N*ACC_W-1:0] p_bus;
+            logic signed [ARRAY_N*BIAS_W-1:0] b_bus;
+            logic signed [ARRAY_N*ACC_BUFF-1:0] e_bus;
+            for (int l = 0; l < ARRAY_N; l = l + 1) begin
+                p_bus[l*ACC_W +: ACC_W]       = l + 1;                  // Lane 0=1, Lane 1=2, ... Lane 7=8
+                b_bus[l*BIAS_W +: BIAS_W]     = (l + 1) * 10;           // Lane 0=10, Lane 1=20, ... Lane 7=80
+                e_bus[l*ACC_BUFF +: ACC_BUFF] = (l + 1) + (l + 1) * 10; // Lane 0=11, Lane 1=22, ... Lane 7=88
+            end
+            drive_inputs_packed(1'b1, p_bus, 1'b1, 1'b1, b_bus, 1'b1, 8'h0A,
+                                1'b1, 1'b0, 1'b0, e_bus);
+        end
+
+        // ==========================================
+        // TEST 4: Signed Arithmetic Test (Negative Values)
+        // ==========================================
+        $display("\n--- TEST 4: Signed Arithmetic Test (Negative Values) ---");
+        reset_dut();
+
+        $display(" Sub-tile 1 (k=0, FIRST=1, LAST=0): Bias=-100 + Psum=20 => RAM[0x08] = -80");
+        drive_inputs(1'b1, 32'sd20, 1'b1, 1'b0, -32'sd100, 1'b1, 8'h08,
+                     1'b0, 1'b1, 1'b0, -33'sd80);
+
+        $display(" Sub-tile 2 (k=1, FIRST=0, LAST=0): Psum=-30 + RAM[0x08] => RAM[0x08] = -110");
+        drive_inputs(1'b1, -32'sd30, 1'b0, 1'b0, 32'sd0, 1'b1, 8'h08,
+                     1'b0, 1'b1, 1'b1, -33'sd110);
+
+        $display(" Sub-tile 3 (k=2, FIRST=0, LAST=1): Psum=10 + RAM[0x08] => Output = -100");
+        drive_inputs(1'b1, 32'sd10, 1'b0, 1'b1, 32'sd0, 1'b1, 8'h08,
+                     1'b1, 1'b0, 1'b1, -33'sd100);
 
         // ==========================================
         // SUMMARY REPORT
