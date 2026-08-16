@@ -120,6 +120,13 @@ module tb_accum_golden;
     endtask
 
     initial begin
+        for (int j = 0; j < MAX_BEATS; j++) begin
+            v_ctrl[j] = 'x;
+            v_psum[j] = 'x;
+            v_bias[j] = 'x;
+            v_evld[j] = 'x;
+            v_eacc[j] = 'x;
+        end
         $readmemh({VECDIR, "stim_psum.hex"}, v_psum);
         $readmemh({VECDIR, "stim_bias.hex"}, v_bias);
         $readmemh({VECDIR, "stim_ctrl.hex"}, v_ctrl);

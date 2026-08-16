@@ -14,21 +14,20 @@ Widths are taken from rtl/pkg/config_pkg.sv. Keep Config in sync with that file.
 
 Usage:
     from edgeasic_model import Config, AccumulatorModel, gemm_layer
-    cfg = Config()
-    out, report = gemm_layer(A, W, bias, scale, shift, cfg)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from typing import List, Optional, Tuple
 
 import numpy as np
 
 
 # ============================================================================
-# Configuration -- mirrors rtl/pkg/config_pkg.sv
+# Datapath configuration (matches rtl/pkg/config_pkg.sv)
 # ============================================================================
 
 @dataclass(frozen=True)
@@ -39,8 +38,8 @@ class Config:
     ACC_W: int = 32        # INT32 array partial-sum output
     ACC_BUFF: int = 33     # accumulator buffer width  <-- known-narrow, see check_headroom()
     BIAS_W: int = 32       # INT32 bias
-    SCALE_W: int = 24      # requant multiplier
-    SHIFT_W: int = 8       # requant right-shift
+    SCALE_W: int = 24      # requant multiplier (unsigned)
+    SHIFT_W: int = 8       # requant right-shift (unsigned)
     OUT_W: int = 8         # INT8 output
     ACC_ADDR_W: int = 8    # accumulator SRAM address width
 
@@ -58,158 +57,163 @@ class RoundMode(Enum):
     """
     Requantisation rounding mode.
 
-    NOTE -- THIS IS A SPEC DECISION, NOT AN IMPLEMENTATION DETAIL.
-    The RTL requant block does not exist yet. Whichever mode is selected here
-    becomes the specification that block must implement. Changing it later means
-    re-verifying every downstream accuracy number.
-
-    HALF_UP     : add (1 << (shift-1)) before shifting. Simplest in hardware
-                  (one adder), and the most common choice in INT8 accelerators.
-                  Biases very slightly positive on exact .5 cases.
+    HALF_UP     : add (1 << (shift-1)) before shifting. Mathematically identical
+                  to (x >>> s) + x[s-1]. Standard in INT8 accelerators.
     HALF_EVEN   : banker's rounding. Unbiased, but needs an extra LSB compare.
-    TRUNCATE    : arithmetic shift only. Cheapest, but biases toward -inf and
-                  will visibly cost accuracy over a deep network.
-
-    Default is HALF_UP. Revisit only with measured accuracy data.
+    TRUNCATE    : arithmetic shift only.
     """
-    HALF_UP = "half_up"
-    HALF_EVEN = "half_even"
-    TRUNCATE = "truncate"
+    HALF_UP = "HALF_UP"
+    HALF_EVEN = "HALF_EVEN"
+    TRUNCATE = "TRUNCATE"
 
 
 class ActMode(Enum):
-    """Mirrors config_pkg::act_mode_e."""
+    """Activation function. Mirrors config_pkg::act_mode_e."""
     NONE = 0
     RELU = 1
     LUT_SILU = 2
 
 
 # ============================================================================
-# Fixed-width integer primitives
+# Fixed-width signed arithmetic helpers
 # ============================================================================
 
-def wrap_signed(value: int, width: int) -> int:
-    """
-    Truncate to `width` bits and reinterpret as two's complement.
-    Models what a hardware register physically does on overflow: silent wrap.
-    """
+def wrap_signed(val: int, bits: int) -> int:
+    """Simulate hardware two's-complement wrapping to `bits` signed."""
+    mask = (1 << bits) - 1
+    val = val & mask
+    sign_bit = 1 << (bits - 1)
+    return (val ^ sign_bit) - sign_bit
+
+
+def sat_signed(val: int, bits: int) -> int:
+    """Simulate hardware saturation (clamping) to `bits` signed."""
+    min_val = -(1 << (bits - 1))
+    max_val = (1 << (bits - 1)) - 1
+    if val < min_val:
+        return min_val
+    if val > max_val:
+        return max_val
+    return val
+
+
+def fits_signed(val: int, bits: int) -> bool:
+    """True if val can be represented in `bits` signed without wrapping."""
+    min_val = -(1 << (bits - 1))
+    max_val = (1 << (bits - 1)) - 1
+    return min_val <= val <= max_val
+
+
+def pack_lanes(values: List[int], width: int) -> int:
+    """Pack a list of ints into a single wide integer (lane 0 in LSBs)."""
+    out = 0
     mask = (1 << width) - 1
-    v = value & mask
-    if v >= (1 << (width - 1)):
-        v -= (1 << width)
-    return v
-
-
-def sat_signed(value: int, width: int) -> int:
-    """Clamp to the signed range representable in `width` bits."""
-    lo = -(1 << (width - 1))
-    hi = (1 << (width - 1)) - 1
-    return max(lo, min(hi, value))
-
-
-def fits_signed(value: int, width: int) -> bool:
-    lo = -(1 << (width - 1))
-    hi = (1 << (width - 1)) - 1
-    return lo <= value <= hi
-
-
-def to_hex(value: int, width: int) -> str:
-    """Format a signed value as fixed-width hex for $readmemh."""
-    mask = (1 << width) - 1
-    nibbles = (width + 3) // 4
-    return format(value & mask, f"0{nibbles}x")
-
-
-def pack_lanes(values: List[int], lane_width: int) -> int:
-    """Pack lane values into one bus word, lane 0 in the LSBs (matches RTL +: slicing)."""
-    mask = (1 << lane_width) - 1
-    word = 0
     for i, v in enumerate(values):
-        word |= (v & mask) << (i * lane_width)
-    return word
-
-
-def unpack_lanes(word: int, lane_width: int, n_lanes: int) -> List[int]:
-    """Inverse of pack_lanes, returning signed values."""
-    mask = (1 << lane_width) - 1
-    out = []
-    for i in range(n_lanes):
-        raw = (word >> (i * lane_width)) & mask
-        if raw >= (1 << (lane_width - 1)):
-            raw -= (1 << lane_width)
-        out.append(raw)
+        out |= (int(v) & mask) << (i * width)
     return out
 
 
+def unpack_lanes(packed: int, width: int, n: int) -> List[int]:
+    """Unpack a wide integer into `n` signed values of `width` bits."""
+    out = []
+    mask = (1 << width) - 1
+    for i in range(n):
+        raw = (packed >> (i * width)) & mask
+        out.append(wrap_signed(raw, width))
+    return out
+
+
+def to_hex(packed: int, width: int) -> str:
+    """Format a wide integer as a fixed-width hex string for $readmemh."""
+    val = int(packed) & ((1 << width) - 1)
+    chars = math.ceil(width / 4)
+    return f"{val:0{chars}X}"
+
+
 # ============================================================================
-# Overflow reporting
+# Core datapath stages
+# ============================================================================
+
+def systolic_tile(
+    act: np.ndarray,
+    wgt: np.ndarray,
+    cfg: Config,
+) -> np.ndarray:
+    """
+    Simulates the 8x8 systolic array output for a single sub-tile.
+    act : (ARRAY_N, ARRAY_N) signed INT8
+    wgt : (ARRAY_N, ARRAY_N) signed INT8
+    returns : (ARRAY_N, ARRAY_N) signed INT32 partial sums
+    """
+    assert act.shape == (cfg.ARRAY_N, cfg.ARRAY_N)
+    assert wgt.shape == (cfg.ARRAY_N, cfg.ARRAY_N)
+    assert act.dtype == np.int64 or np.issubdtype(act.dtype, np.signedinteger)
+    assert wgt.dtype == np.int64 or np.issubdtype(wgt.dtype, np.signedinteger)
+
+    return (act.astype(np.int64) @ wgt.astype(np.int64)).astype(np.int64)
+
+
+# ============================================================================
+# Accumulator model and headroom tracker
 # ============================================================================
 
 @dataclass
 class OverflowReport:
-    """
-    Records how close the accumulator came to its limit, and whether it blew past it.
-
-    `max_abs_untruncated` is the headroom metric: it says what accumulator width the
-    workload actually needed. Use it to size ACC_BUFF from evidence rather than guesswork.
-    """
+    """Diagnostic capture of overflow events across an accumulation run."""
     events: int = 0
     max_abs_untruncated: int = 0
-    first_event: Optional[Tuple[int, int, int]] = None  # (addr, lane, true_value)
+    first_event_info: Optional[dict] = None
 
-    def note(self, addr: int, lane: int, true_value: int, wrapped: int) -> None:
-        self.max_abs_untruncated = max(self.max_abs_untruncated, abs(true_value))
-        if true_value != wrapped:
+    def record(self, true_val: int, wrapped_val: int, info: dict) -> None:
+        abs_v = abs(true_val)
+        if abs_v > self.max_abs_untruncated:
+            self.max_abs_untruncated = abs_v
+        if true_val != wrapped_val:
             self.events += 1
-            if self.first_event is None:
-                self.first_event = (addr, lane, true_value)
+            if self.first_event_info is None:
+                self.first_event_info = {
+                    "true_value": true_val,
+                    "wrapped_value": wrapped_val,
+                    **info,
+                }
 
     def required_width(self) -> int:
-        """Minimum ACC_BUFF that would have held every value seen."""
+        """Bits needed to hold max_abs_untruncated without wrapping."""
         if self.max_abs_untruncated == 0:
             return 1
         return self.max_abs_untruncated.bit_length() + 1
 
     def summary(self, cfg: Config) -> str:
-        need = self.required_width()
-        head = cfg.ACC_BUFF - need
+        req = self.required_width()
         lines = [
-            f"  accumulator overflow events : {self.events}",
-            f"  max |value| observed        : {self.max_abs_untruncated}",
-            f"  width required              : {need} bits",
-            f"  ACC_BUFF configured         : {cfg.ACC_BUFF} bits  (headroom {head:+d})",
+            f"Overflow events       : {self.events}",
+            f"Max magnitude reached : {self.max_abs_untruncated:,}",
+            f"Required signed width : {req} bits (hardware ACC_BUFF is {cfg.ACC_BUFF})",
+            f"Headroom remaining    : {cfg.ACC_BUFF - req} bits",
         ]
-        if self.events:
-            a, l, v = self.first_event
-            lines.append(f"  !! FIRST OVERFLOW at addr=0x{a:02x} lane={l} true={v}")
+        if self.events > 0:
+            lines.append("FIRST OVERFLOW EVENT:")
+            for k, v in self.first_event_info.items():
+                lines.append(f"  {k}: {v}")
         return "\n".join(lines)
 
 
-# ============================================================================
-# Accumulator -- bit-accurate model of accum_engine + accum_buffer
-# ============================================================================
-
 class AccumulatorModel:
     """
-    Models rtl/core/accum_engine.sv + accum_buffer.sv at the value level.
+    Bit-accurate model of rtl/core/accum_engine.sv + accum_buffer.sv.
 
-    Reproduces exactly:
-      - k_tile_first  -> seed with bias  (SRAM not read)
-      - otherwise     -> read SRAM, add psum
-      - k_tile_last   -> emit to output, do NOT write back
-      - otherwise     -> write back to SRAM
-      - every stored value truncated to ACC_BUFF bits (this is where overflow bites)
-
-    Pipeline latency and the RAW bypass are deliberately NOT modelled. Those are
-    timing behaviours already covered by the directed testbenches; mixing them in
-    here would make the model harder to trust as a value reference.
+    Tracks both the wrapped (hardware-faithful) value and the untruncated truth
+    so silently wrapped sums are caught.
     """
-
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.mem: List[List[int]] = [
-            [0] * cfg.ARRAY_N for _ in range(cfg.ACC_DEPTH)
-        ]
+        self.sram_hw = np.zeros((cfg.ACC_DEPTH, cfg.ARRAY_N), dtype=np.int64)
+        self.sram_true = np.zeros((cfg.ACC_DEPTH, cfg.ARRAY_N), dtype=np.int64)
+        self.report = OverflowReport()
+
+    def reset(self) -> None:
+        self.sram_hw.fill(0)
+        self.sram_true.fill(0)
         self.report = OverflowReport()
 
     def step(
@@ -221,70 +225,79 @@ class AccumulatorModel:
         k_last: bool,
     ) -> Optional[List[int]]:
         """
-        Process one sub-tile beat. Returns the ACC_BUFF-wide output vector when
-        k_last is set, otherwise None (result stayed in SRAM).
+        Mirror one beat through accum_engine.
+
+        Returns:
+            List[int] of length ARRAY_N if k_last is True (emitted output beat).
+            None if intermediate sub-tile (result remains in SRAM).
         """
-        cfg = self.cfg
-        assert len(psum) == cfg.ARRAY_N, "psum must have ARRAY_N lanes"
-        assert 0 <= addr < cfg.ACC_DEPTH, f"addr {addr} out of range"
+        assert len(psum) == self.cfg.ARRAY_N
+        assert len(bias) == self.cfg.ARRAY_N
+        assert 0 <= addr < self.cfg.ACC_DEPTH
 
-        result: List[int] = []
-        for lane in range(cfg.ARRAY_N):
+        out_hw: List[int] = []
+        for lane in range(self.cfg.ARRAY_N):
             p = psum[lane]
-            assert fits_signed(p, cfg.ACC_W), f"psum lane {lane} exceeds ACC_W"
+            b = bias[lane]
+            assert fits_signed(p, self.cfg.ACC_W), f"psum[{lane}] exceeds ACC_W"
+            assert fits_signed(b, self.cfg.BIAS_W), f"bias[{lane}] exceeds BIAS_W"
 
-            if k_first:
-                true_val = bias[lane] + p
-            else:
-                true_val = self.mem[addr][lane] + p
+            # Mirror the 1R1W read-modify-write
+            old_hw = 0 if k_first else self.sram_hw[addr, lane]
+            old_true = 0 if k_first else self.sram_true[addr, lane]
 
-            wrapped = wrap_signed(true_val, cfg.ACC_BUFF)
-            self.report.note(addr, lane, true_val, wrapped)
-            result.append(wrapped)
+            addend = b if k_first else 0
+            new_true = old_true + addend + p
+            new_hw = wrap_signed(old_hw + addend + p, self.cfg.ACC_BUFF)
 
-        if not k_last:
-            self.mem[addr] = list(result)
-            return None
-        return result
+            self.report.record(new_true, new_hw, {
+                "addr": addr,
+                "lane": lane,
+                "k_first": k_first,
+                "k_last": k_last,
+            })
+
+            self.sram_true[addr, lane] = new_true
+            self.sram_hw[addr, lane] = new_hw
+            out_hw.append(new_hw)
+
+        return out_hw if k_last else None
 
 
-# ============================================================================
-# Systolic array -- the math of rtl/core/systolic_array_8x8.sv
-# ============================================================================
-
-def systolic_tile(
-    act_tile: np.ndarray,   # (M, 8) INT8 -- activations, M output rows
-    wgt_tile: np.ndarray,   # (8, 8) INT8 -- weights, W[k][n] at PE(row=k, col=n)
-    cfg: Config,
-) -> np.ndarray:
+def check_headroom(k_depth: int, cfg: Config) -> dict:
     """
-    One 8x8 weight-stationary tile: O[m][n] = sum_k A[m][k] * W[k][n].
-
-    Computed in int64 then range-checked against ACC_W. The array itself cannot
-    overflow INT32 (8 * 127 * 127 = 129,032 fits in 18 bits), so a failure here
-    means malformed input rather than a real hardware limit.
+    Theoretical worst-case headroom check for a given K depth.
     """
-    a = act_tile.astype(np.int64)
-    w = wgt_tile.astype(np.int64)
-    out = a @ w
+    assert k_depth % cfg.ARRAY_N == 0, "K must be a multiple of ARRAY_N"
+    sub_tiles = k_depth // cfg.ARRAY_N
 
-    lim = 1 << (cfg.ACC_W - 1)
-    if np.any(out >= lim) or np.any(out < -lim):
-        raise OverflowError("systolic tile exceeded ACC_W -- check input ranges")
-    return out
+    peak_subtile = cfg.ARRAY_N * 128 * 128
+    worst_psum = sub_tiles * peak_subtile
+    worst_bias = (1 << (cfg.BIAS_W - 1)) - 1
+    worst_total = worst_psum + worst_bias
+
+    req_bits = worst_total.bit_length() + 1
+    safe = req_bits <= cfg.ACC_BUFF
+
+    return {
+        "K": k_depth,
+        "sub_tiles": sub_tiles,
+        "worst_total": worst_total,
+        "required_width": req_bits,
+        "acc_buff_width": cfg.ACC_BUFF,
+        "headroom_bits": cfg.ACC_BUFF - req_bits,
+        "safe": safe,
+    }
 
 
-def sddu_deskew(raw: np.ndarray, cfg: Config) -> np.ndarray:
-    """
-    Model of rtl/core/sddu.sv.
-
-    In hardware, column n drains n cycles late, so the SDDU delays lane n by
-    (ARRAY_N-1-n) cycles to realign. At the value level that is a pure identity:
-    the same numbers come out, just time-aligned. Included explicitly so the
-    model's structure matches the RTL block diagram, and as the hook for any
-    future lane-masking behaviour.
-    """
-    return raw
+def max_safe_K(cfg: Config) -> int:
+    """Return the largest K dimension that cannot overflow ACC_BUFF."""
+    max_acc = (1 << (cfg.ACC_BUFF - 1)) - 1
+    worst_bias = (1 << (cfg.BIAS_W - 1)) - 1
+    avail_for_psum = max_acc - worst_bias
+    peak_subtile = cfg.ARRAY_N * 128 * 128
+    sub_tiles = avail_for_psum // peak_subtile
+    return int(sub_tiles * cfg.ARRAY_N)
 
 
 # ============================================================================
@@ -324,6 +337,7 @@ def requantize(
     elif mode is RoundMode.TRUNCATE:
         shifted = product >> shift                      # arithmetic, floors toward -inf
     elif mode is RoundMode.HALF_UP:
+        # Shift-then-increment identity: (product + (1 << (shift-1))) >> shift
         shifted = (product + (1 << (shift - 1))) >> shift
     elif mode is RoundMode.HALF_EVEN:
         half = 1 << (shift - 1)
@@ -369,78 +383,62 @@ class LayerResult:
 
 
 def gemm_layer(
-    A: np.ndarray,          # (M, K) INT8 activations
-    W: np.ndarray,          # (K, N) INT8 weights
-    bias: np.ndarray,       # (N,)   INT32
-    scale: np.ndarray,      # (N,)   unsigned, SCALE_W bits
-    shift: np.ndarray,      # (N,)   unsigned, SHIFT_W bits
-    cfg: Config,
-    act_mode: ActMode = ActMode.NONE,
+    A: np.ndarray,
+    W: np.ndarray,
+    bias: np.ndarray,
+    scale: np.ndarray,
+    shift: np.ndarray,
+    cfg: Config = Config(),
     round_mode: RoundMode = RoundMode.HALF_UP,
-    acc_addr_base: int = 0,
+    act_mode: ActMode = ActMode.NONE,
 ) -> LayerResult:
     """
-    Full layer through the modelled datapath, tiled exactly as hardware runs it:
-    K is split into ceil(K/8) sub-tiles, each accumulated through the SRAM.
-
-    M and N must be multiples of ARRAY_N. Partial-tile lane masking is a separate
-    feature (pipe_meta_t.lane_valid) and is not modelled yet.
+    Run an entire (M, K) x (K, N) layer through the model.
     """
-    n = cfg.ARRAY_N
     M, K = A.shape
-    K2, N = W.shape
-    assert K == K2, f"inner dimensions disagree: {K} vs {K2}"
-    assert M % n == 0 and N % n == 0, f"M and N must be multiples of {n}"
-
-    n_ktiles = (K + n - 1) // n
-    K_pad = n_ktiles * n
-    if K_pad != K:
-        A = np.pad(A, ((0, 0), (0, K_pad - K)))
-        W = np.pad(W, ((0, K_pad - K), (0, 0)))
+    Kw, N = W.shape
+    assert K == Kw, "inner dimensions must match"
+    assert M % cfg.ARRAY_N == 0, "M must be a multiple of ARRAY_N"
+    assert N % cfg.ARRAY_N == 0, "N must be a multiple of ARRAY_N"
+    assert K % cfg.ARRAY_N == 0, "K must be a multiple of ARRAY_N"
+    assert bias.shape == (N,)
+    assert scale.shape == (N,)
+    assert shift.shape == (N,)
 
     accum = AccumulatorModel(cfg)
     acc_hw = np.zeros((M, N), dtype=np.int64)
+
     beats: List[dict] = []
 
-    n_col_tiles = N // n
+    for m0 in range(0, M, cfg.ARRAY_N):
+        for n0 in range(0, N, cfg.ARRAY_N):
+            for k0 in range(0, K, cfg.ARRAY_N):
+                k_first = (k0 == 0)
+                k_last = (k0 == K - cfg.ARRAY_N)
 
-    for m0 in range(0, M, n):
-        for n0 in range(0, N, n):
-            bias_tile = [int(bias[n0 + j]) for j in range(n)]
+                act_tile = A[m0:m0 + cfg.ARRAY_N, k0:k0 + cfg.ARRAY_N]
+                wgt_tile = W[k0:k0 + cfg.ARRAY_N, n0:n0 + cfg.ARRAY_N]
+                psums = systolic_tile(act_tile, wgt_tile, cfg)
 
-            for kt in range(n_ktiles):
-                k0 = kt * n
-                psum_tile = systolic_tile(
-                    A[m0:m0 + n, k0:k0 + n],
-                    W[k0:k0 + n, n0:n0 + n],
-                    cfg,
-                )
-                k_first = (kt == 0)
-                k_last = (kt == n_ktiles - 1)
+                for r in range(cfg.ARRAY_N):
+                    addr = (m0 + r) % cfg.ACC_DEPTH
+                    p_lane = [int(psums[r, c]) for c in range(cfg.ARRAY_N)]
+                    b_lane = [int(bias[n0 + c]) for c in range(cfg.ARRAY_N)] if k_first else [0] * cfg.ARRAY_N
 
-                # Each output row is a separate beat AND a separate accumulator
-                # address. Sharing an address across rows would make row r+1
-                # clobber row r's partial sum.
-                for r in range(n):
-                    psum = [int(v) for v in psum_tile[r]]
-                    beat_addr = acc_addr_base + (m0 + r) * n_col_tiles + (n0 // n)
-                    assert beat_addr < cfg.ACC_DEPTH, (
-                        f"accumulator depth exceeded: need addr {beat_addr}, "
-                        f"ACC_DEPTH is {cfg.ACC_DEPTH}. Max concurrent output rows "
-                        f"is ACC_DEPTH / (N/{n})."
-                    )
-                    out = accum.step(psum, bias_tile, beat_addr, k_first, k_last)
-
+                    out = accum.step(p_lane, b_lane, addr, k_first, k_last)
                     beats.append({
-                        "psum": psum,
-                        "bias": bias_tile if k_first else [0] * n,
-                        "addr": beat_addr,
+                        "m": m0 + r,
+                        "n_base": n0,
+                        "k_tile": k0 // cfg.ARRAY_N,
+                        "addr": addr,
                         "k_first": k_first,
                         "k_last": k_last,
+                        "psum": p_lane,
+                        "bias": b_lane,
                         "expected": out,
                     })
                     if out is not None:
-                        acc_hw[m0 + r, n0:n0 + n] = out
+                        acc_hw[m0 + r, n0:n0 + cfg.ARRAY_N] = out
 
     # Untruncated reference for comparison
     acc_ref = (A.astype(np.int64) @ W.astype(np.int64)) + bias.astype(np.int64)[None, :]
@@ -458,41 +456,3 @@ def gemm_layer(
         overflow=accum.report,
         beats=beats,
     )
-
-
-# ============================================================================
-# Headroom analysis -- sizing ACC_BUFF from evidence
-# ============================================================================
-
-def check_headroom(K: int, cfg: Config, worst_case: bool = True) -> dict:
-    """
-    Analytic answer to 'how wide must ACC_BUFF be for a given K?'
-
-    Worst case per sub-tile is 8 * 127 * 127 = 129,032, and there are ceil(K/8)
-    sub-tiles, plus a full INT32 bias. Use this to set ACC_BUFF rather than
-    guessing -- and note that csr_k is 16 bits, so the CSR currently accepts K
-    values far beyond what a 33-bit accumulator can hold.
-    """
-    n = cfg.ARRAY_N
-    n_ktiles = (K + n - 1) // n
-    per_tile = n * (2 ** (cfg.DATA_W - 1)) ** 2 if worst_case else n * 127 * 127
-    bias_max = 1 << (cfg.BIAS_W - 1)
-    peak = bias_max + n_ktiles * per_tile
-    need = peak.bit_length() + 1
-    return {
-        "K": K,
-        "sub_tiles": n_ktiles,
-        "peak_magnitude": peak,
-        "required_width": need,
-        "configured_width": cfg.ACC_BUFF,
-        "safe": need <= cfg.ACC_BUFF,
-        "headroom_bits": cfg.ACC_BUFF - need,
-    }
-
-
-def max_safe_K(cfg: Config) -> int:
-    """Largest K the current ACC_BUFF can handle without overflow, worst case."""
-    k = cfg.ARRAY_N
-    while check_headroom(k + cfg.ARRAY_N, cfg)["safe"]:
-        k += cfg.ARRAY_N
-    return k
