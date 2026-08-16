@@ -3,11 +3,16 @@ package config_pkg;
 
     // Computational Core Parameters
     localparam int N = 8;                  // Array dimension (8x8 grid)
+    localparam int ARRAY_N = N;            // Alias for array dimension (8)
     localparam int PE_COUNT = 64;          // Total processing elements
 
     // Datapath Bit-Widths
     localparam int DATA_W = 8;             // INT8 Activation and Weight precision
+    localparam int ACT_W  = DATA_W;        // INT8 Activation precision alias
+    localparam int WGT_W  = DATA_W;        // INT8 Weight precision alias
+    localparam int OUT_W  = DATA_W;        // INT8 Output precision alias
     localparam int ACC_W = 32;             // INT32 Accumulator precision
+    localparam int ACC_BUFF = 33;          // INT33 for accumulator buffer (deliberate 33-bit width to prevent signed overflow on multi-K accumulation)
     localparam int BIAS_W = 32;            // INT32 Bias precision
     localparam int SCALE_W = 24;           // INT24 Quantization fixed-point scale precision
     localparam int SHIFT_W = 8;            // Right-shift parameter precision
