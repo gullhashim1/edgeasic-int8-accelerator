@@ -101,9 +101,8 @@ module tb_axi_dma_master_abs;
         end
 
         // TEST 3: TC-DMA-001 4KB Page Boundary Crossing Rejection
-        $display("\n[TEST 3] TC-DMA-001: 4KB Boundary Violation Rejection (Addr 0x1F00 + 512 Bytes > 4KB boundary)");
+        $display("\n[TEST 3] TC-DMA-001: 4KB Boundary Violation Rejection (Addr 0x1F00 + 512 Bytes = 4352 > 4096)");
         @(posedge clk);
-        // Base addr lower 12 bits = 0xF00 (3840). 3840 + 512 = 4352 > 4096!
         dma_req_valid <= 1'b1;
         dma_req_addr  <= 64'h0000_1F00;
         dma_req_bytes <= 16'd512;
@@ -125,6 +124,96 @@ module tb_axi_dma_master_abs;
             errors++;
         end else begin
             $display("  PASS: External AXI bus untouched (axi_valid=0).");
+        end
+
+        // TEST 4: Exact Boundary Touch (0x0FFF + 1 Byte = 4096 -> MUST BE ACCEPTED)
+        $display("\n[TEST 4] Exact 4096 Boundary Touch: Addr 0x0FFF + 1 Byte = 4096 (Legal)");
+        @(posedge clk);
+        dma_req_valid <= 1'b1;
+        dma_req_addr  <= 64'h0000_0FFF;
+        dma_req_bytes <= 16'd1;
+        dma_req_write <= 1'b0;
+        @(posedge clk);
+        dma_req_valid <= 1'b0;
+        #1;
+
+        if (axi_valid !== 1'b1 || error_axi_boundary !== 1'b0) begin
+            $display("  FAIL: Exact boundary (4096) was erroneously rejected! axi_valid=%0b, err=%0b",
+                     axi_valid, error_axi_boundary);
+            errors++;
+        end else begin
+            $display("  PASS: Exact boundary (sum=4096) correctly accepted as legal transfer.");
+        end
+
+        // Complete AXI handshake
+        @(posedge clk);
+        axi_ready <= 1'b1;
+        @(posedge clk);
+        axi_ready <= 1'b0;
+        #1;
+
+        // TEST 5: Off-by-one Boundary Overstep (0x0FFF + 2 Bytes = 4097 -> MUST BE REJECTED)
+        $display("\n[TEST 5] Off-by-One Boundary Overstep: Addr 0x0FFF + 2 Bytes = 4097 (Illegal)");
+        @(posedge clk);
+        dma_req_valid <= 1'b1;
+        dma_req_addr  <= 64'h0000_0FFF;
+        dma_req_bytes <= 16'd2;
+        dma_req_write <= 1'b0;
+        @(posedge clk);
+        dma_req_valid <= 1'b0;
+        #1;
+
+        if (dma_done !== 1'b1 || dma_error !== 1'b1 || error_axi_boundary !== 1'b1 || axi_valid !== 1'b0) begin
+            $display("  FAIL: 4097-byte overstep was not rejected locally! done=%0b, err=%0b, axi_err=%0b",
+                     dma_done, dma_error, error_axi_boundary);
+            errors++;
+        end else begin
+            $display("  PASS: 4097-byte overstep correctly rejected locally (axi_valid=0, error=1).");
+        end
+
+        // TEST 6: Full 4KB Page from Base (0x0000 + 4096 Bytes = 4096 -> MUST BE ACCEPTED)
+        $display("\n[TEST 6] Full 4KB Page from Base: Addr 0x0000 + 4096 Bytes = 4096 (Legal)");
+        @(posedge clk);
+        dma_req_valid <= 1'b1;
+        dma_req_addr  <= 64'h0000_0000;
+        dma_req_bytes <= 16'd4096;
+        dma_req_write <= 1'b0;
+        @(posedge clk);
+        dma_req_valid <= 1'b0;
+        #1;
+
+        if (axi_valid !== 1'b1 || error_axi_boundary !== 1'b0) begin
+            $display("  FAIL: Full 4KB page was erroneously rejected! axi_valid=%0b, err=%0b",
+                     axi_valid, error_axi_boundary);
+            errors++;
+        end else begin
+            $display("  PASS: Full 4KB page (sum=4096) correctly accepted as legal transfer.");
+        end
+
+        // Complete AXI handshake
+        @(posedge clk);
+        axi_ready <= 1'b1;
+        @(posedge clk);
+        axi_ready <= 1'b0;
+        #1;
+
+        // TEST 7: Full 4KB Page + 1 Byte (0x0000 + 4097 Bytes = 4097 -> MUST BE REJECTED)
+        $display("\n[TEST 7] Full 4KB Page + 1 Byte: Addr 0x0000 + 4097 Bytes = 4097 (Illegal)");
+        @(posedge clk);
+        dma_req_valid <= 1'b1;
+        dma_req_addr  <= 64'h0000_0000;
+        dma_req_bytes <= 16'd4097;
+        dma_req_write <= 1'b0;
+        @(posedge clk);
+        dma_req_valid <= 1'b0;
+        #1;
+
+        if (dma_done !== 1'b1 || dma_error !== 1'b1 || error_axi_boundary !== 1'b1 || axi_valid !== 1'b0) begin
+            $display("  FAIL: 4097-byte transfer was not rejected locally! done=%0b, err=%0b, axi_err=%0b",
+                     dma_done, dma_error, error_axi_boundary);
+            errors++;
+        end else begin
+            $display("  PASS: 4097-byte transfer correctly rejected locally (axi_valid=0, error=1).");
         end
 
         $display("\n=================================================");
