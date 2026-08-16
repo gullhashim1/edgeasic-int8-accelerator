@@ -1,6 +1,7 @@
 # EdgeASIC INT8 Accelerator -- Top-Level Simulation and Golden-Model Makefile
 #
 #   make                run every unit testbench (PE, Array, SDDU, Accum, Requant)
+#   make sddu           run SDDU basic and metadata testbenches
 #   make requant        run requant directed testbench
 #   make requant-golden run requant 5000-beat golden regression
 #   make golden         regenerate vectors + run all golden regressions
@@ -39,9 +40,12 @@ array: dirs
 	@$(VVP) $(SIM)/array.vvp
 
 sddu: dirs
-	@echo "=== [3/6] SDDU ==="
+	@echo "=== [3/6] SDDU (Basic Deskew) ==="
 	@$(IVERILOG) -o $(SIM)/sddu.vvp $(PKG) rtl/core/sddu.sv tb/tb_SDDU.sv
 	@$(VVP) $(SIM)/sddu.vvp
+	@echo "=== [3/6] SDDU (Metadata & Data Integrity) ==="
+	@$(IVERILOG) -o $(SIM)/sddu_meta.vvp $(PKG) rtl/core/sddu.sv tb/tb_sddu_meta.sv
+	@$(VVP) $(SIM)/sddu_meta.vvp
 
 accum: dirs
 	@echo "=== [4/6] ACCUMULATOR (directed) ==="

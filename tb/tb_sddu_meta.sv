@@ -27,7 +27,7 @@ module tb_sddu_meta;
     // Clock Generation (200 MHz)
     always #2.5 clk = ~clk;
 
-    // 1. Direct DUT Instantiation (Fixes Flaw 1)
+    // 1. Direct DUT Instantiation
     sddu u_sddu (
         .clk              (clk),
         .rst_n            (rst_n),
@@ -44,7 +44,7 @@ module tb_sddu_meta;
         .out_acc_addr     (out_acc_addr)
     );
 
-    // 2. Simulator-Agnostic Assertions (Fixes Flaw 2 for Icarus/Questa)
+    // 2. Simulator-Agnostic Assertions
     always @(posedge clk) begin
         if (rst_n && out_valid) begin
             if ($isunknown(out_k_tile_first) || $isunknown(out_k_tile_last) || $isunknown(out_acc_addr)) begin
@@ -53,9 +53,11 @@ module tb_sddu_meta;
         end
     end
 
-    // 3. Stimulus & Lane-by-Lane Data Integrity Verification (Fixes Flaw 3)
+    // 3. Stimulus & Lane-by-Lane Data Integrity Verification
     int timeout_count;
     bit data_mismatch;
+    int32_s expected_val;
+    int32_s actual_val;
 
     initial begin
         clk             = 0;
@@ -113,8 +115,8 @@ module tb_sddu_meta;
 
             // Verify arithmetic output integrity on all 8 lanes simultaneously
             for (int lane = 0; lane < ARRAY_N; lane++) begin
-                int32_s expected_val = int32_s'(32'h100 + lane);
-                int32_s actual_val   = out_psum_bus[lane*ACC_W +: ACC_W];
+                expected_val = int32_s'(32'h100 + lane);
+                actual_val   = out_psum_bus[lane*ACC_W +: ACC_W];
 
                 if (actual_val !== expected_val) begin
                     $display("[FAIL] Lane %0d mismatch! Expected: 0x%0h, Actual: 0x%0h", lane, expected_val, actual_val);
