@@ -181,7 +181,7 @@ class OverflowReport:
         """Bits needed to hold max_abs_untruncated without wrapping."""
         if self.max_abs_untruncated == 0:
             return 1
-        return self.max_abs_untruncated.bit_length() + 1
+        return int(self.max_abs_untruncated).bit_length() + 1
 
     def summary(self, cfg: Config) -> str:
         req = self.required_width()
@@ -268,8 +268,7 @@ def check_headroom(k_depth: int, cfg: Config) -> dict:
     """
     Theoretical worst-case headroom check for a given K depth.
     """
-    assert k_depth % cfg.ARRAY_N == 0, "K must be a multiple of ARRAY_N"
-    sub_tiles = k_depth // cfg.ARRAY_N
+    sub_tiles = (k_depth + cfg.ARRAY_N - 1) // cfg.ARRAY_N
 
     peak_subtile = cfg.ARRAY_N * 128 * 128
     worst_psum = sub_tiles * peak_subtile
