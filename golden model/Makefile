@@ -3,7 +3,7 @@
 #   make                run every unit testbench (Datapath, Control, Memory, Golden Regressions)
 #   make core           run compute datapath testbenches (PE, Array, SDDU, Accum, Requant)
 #   make control        run control layer testbenches (CSR, Descriptor, Dispatcher)
-#   make memory         run memory layer testbenches (Bank State Controller, Packing FIFO)
+#   make memory         run memory layer testbenches (BSC, Packing FIFO, DMA Master, Router, SRAMs)
 #   make requant        run requant directed testbench
 #   make requant-golden run requant 5000-beat golden regression
 #   make golden         regenerate vectors + run all golden regressions
@@ -21,15 +21,15 @@ PKG  := rtl/pkg/config_pkg.sv rtl/pkg/types_pkg.sv
 VEC_SEEDS ?= 1 7 42 1337 99999
 VEC_BEATS ?= 5000
 
-.PHONY: all core control memory pe array sddu accum adversarial requant requant-golden csr desc disp bsc fifo golden sweep model vectors clean dirs
+.PHONY: all core control memory pe array sddu accum adversarial requant requant-golden csr desc disp bsc fifo dma router act_sram wgt_sram out_sram golden sweep model vectors clean dirs
 
-all: pe array sddu accum adversarial requant requant-golden csr desc disp bsc fifo
+all: pe array sddu accum adversarial requant requant-golden csr desc disp bsc fifo dma router act_sram wgt_sram out_sram
 
 core: pe array sddu accum adversarial requant requant-golden
 
 control: csr desc disp
 
-memory: bsc fifo
+memory: bsc fifo dma router act_sram wgt_sram out_sram
 
 dirs:
 	@mkdir -p $(SIM) tb/vectors
@@ -39,43 +39,43 @@ dirs:
 # ============================================================================
 
 pe: dirs
-	@echo "=== [1/10] PE MAC ==="
+	@echo "=== [1/15] PE MAC ==="
 	@$(IVERILOG) -o $(SIM)/pe.vvp $(PKG) rtl/core/pe_mac.sv tb/tb_pe_mac.sv
 	@$(VVP) $(SIM)/pe.vvp
 
 array: dirs
-	@echo "=== [2/10] 8x8 SYSTOLIC ARRAY ==="
+	@echo "=== [2/15] 8x8 SYSTOLIC ARRAY ==="
 	@$(IVERILOG) -o $(SIM)/array.vvp $(PKG) rtl/core/pe_mac.sv \
 		rtl/core/systolic_array_8x8.sv tb/tb_systolic_array_8x8.sv
 	@$(VVP) $(SIM)/array.vvp
 
 sddu: dirs
-	@echo "=== [3/10] SDDU (Basic Deskew) ==="
+	@echo "=== [3/15] SDDU (Basic Deskew) ==="
 	@$(IVERILOG) -o $(SIM)/sddu.vvp $(PKG) rtl/core/sddu.sv tb/tb_SDDU.sv
 	@$(VVP) $(SIM)/sddu.vvp
-	@echo "=== [3/10] SDDU (Metadata & Data Integrity) ==="
+	@echo "=== [3/15] SDDU (Metadata & Data Integrity) ==="
 	@$(IVERILOG) -o $(SIM)/sddu_meta.vvp $(PKG) rtl/core/sddu.sv tb/tb_sddu_meta.sv
 	@$(VVP) $(SIM)/sddu_meta.vvp
 
 accum: dirs
-	@echo "=== [4/10] ACCUMULATOR (directed) ==="
+	@echo "=== [4/15] ACCUMULATOR (directed) ==="
 	@$(IVERILOG) -o $(SIM)/accum.vvp $(PKG) rtl/core/accum_buffer.sv \
 		rtl/core/accum_engine.sv tb/tb_accum_system.sv
 	@$(VVP) $(SIM)/accum.vvp
 
 adversarial: dirs
-	@echo "=== [5/10] ACCUMULATOR (adversarial: stall + bypass + overflow) ==="
+	@echo "=== [5/15] ACCUMULATOR (adversarial: stall + bypass + overflow) ==="
 	@$(IVERILOG) -o $(SIM)/adv.vvp $(PKG) rtl/core/accum_buffer.sv \
 		rtl/core/accum_engine.sv 'golden model/tb_accum_adversarial.sv'
 	@$(VVP) $(SIM)/adv.vvp
 
 requant: dirs
-	@echo "=== [6/10] REQUANT (directed) ==="
+	@echo "=== [6/15] REQUANT (directed) ==="
 	@$(IVERILOG) -o $(SIM)/requant.vvp $(PKG) rtl/core/requant.sv tb/tb_requant.sv
 	@$(VVP) $(SIM)/requant.vvp
 
 requant-golden: dirs vectors
-	@echo "=== [6/10] REQUANT (golden 5000-beat regression) ==="
+	@echo "=== [6/15] REQUANT (golden 5000-beat regression) ==="
 	@$(IVERILOG) -o $(SIM)/requant_golden.vvp $(PKG) rtl/core/requant.sv tb/tb_requant_golden.sv
 	@$(VVP) $(SIM)/requant_golden.vvp
 
@@ -84,17 +84,17 @@ requant-golden: dirs vectors
 # ============================================================================
 
 csr: dirs
-	@echo "=== [7/10] CSR BLOCK (TC-CSR-001/002) ==="
+	@echo "=== [7/15] CSR BLOCK (TC-CSR-001/002) ==="
 	@$(IVERILOG) -o $(SIM)/csr.vvp $(PKG) rtl/control/csr_block.sv tb/tb_csr_block.sv
 	@$(VVP) $(SIM)/csr.vvp
 
 desc: dirs
-	@echo "=== [8/10] DESCRIPTOR MANAGER (TC-DESC-001/002) ==="
+	@echo "=== [8/15] DESCRIPTOR MANAGER (TC-DESC-001/002) ==="
 	@$(IVERILOG) -o $(SIM)/desc.vvp $(PKG) rtl/control/descriptor_manager.sv tb/tb_descriptor_manager.sv
 	@$(VVP) $(SIM)/desc.vvp
 
 disp: dirs
-	@echo "=== [9/10] OPERATOR DISPATCHER (TC-ERR-001) ==="
+	@echo "=== [9/15] OPERATOR DISPATCHER (TC-ERR-001) ==="
 	@$(IVERILOG) -o $(SIM)/disp.vvp $(PKG) rtl/control/operator_dispatcher.sv tb/tb_operator_dispatcher.sv
 	@$(VVP) $(SIM)/disp.vvp
 
@@ -103,14 +103,39 @@ disp: dirs
 # ============================================================================
 
 bsc: dirs
-	@echo "=== [10/10] BANK STATE CONTROLLER (TC-BSC-001/002) ==="
+	@echo "=== [10/15] BANK STATE CONTROLLER (TC-BSC-001/002) ==="
 	@$(IVERILOG) -o $(SIM)/bsc.vvp $(PKG) rtl/memory/bank_state_controller.sv tb/tb_bank_state_controller.sv
 	@$(VVP) $(SIM)/bsc.vvp
 
 fifo: dirs
-	@echo "=== [10/10] PACKING FIFO (TC-FIFO-001/002) ==="
+	@echo "=== [11/15] PACKING FIFO (TC-FIFO-001/002) ==="
 	@$(IVERILOG) -o $(SIM)/fifo.vvp $(PKG) rtl/memory/packing_fifo.sv tb/tb_packing_fifo.sv
 	@$(VVP) $(SIM)/fifo.vvp
+
+dma: dirs
+	@echo "=== [12/15] AXI DMA MASTER (TC-DMA-001/002) ==="
+	@$(IVERILOG) -o $(SIM)/dma.vvp $(PKG) rtl/memory/axi_dma_master_abs.sv tb/tb_axi_dma_master_abs.sv
+	@$(VVP) $(SIM)/dma.vvp
+
+router: dirs
+	@echo "=== [13/15] DMA READ ROUTER (TC-DMA-003) ==="
+	@$(IVERILOG) -o $(SIM)/router.vvp $(PKG) rtl/memory/dma_read_router.sv tb/tb_dma_read_router.sv
+	@$(VVP) $(SIM)/router.vvp
+
+act_sram: dirs
+	@echo "=== [14/15] ACTIVATION SRAM (TC-MEM-001) ==="
+	@$(IVERILOG) -o $(SIM)/act_sram.vvp $(PKG) rtl/memory/activation_sram.sv tb/tb_activation_sram.sv
+	@$(VVP) $(SIM)/act_sram.vvp
+
+wgt_sram: dirs
+	@echo "=== [14/15] WEIGHT SRAM (TC-MEM-001) ==="
+	@$(IVERILOG) -o $(SIM)/wgt_sram.vvp $(PKG) rtl/memory/weight_sram.sv tb/tb_weight_sram.sv
+	@$(VVP) $(SIM)/wgt_sram.vvp
+
+out_sram: dirs
+	@echo "=== [15/15] OUTPUT SRAM (TC-MEM-001) ==="
+	@$(IVERILOG) -o $(SIM)/out_sram.vvp $(PKG) rtl/memory/output_sram.sv tb/tb_output_sram.sv
+	@$(VVP) $(SIM)/out_sram.vvp
 
 # ============================================================================
 # Golden Model & Regression Targets
